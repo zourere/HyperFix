@@ -21,7 +21,7 @@ import { normalizeAndDeduplicate } from '@/lib/cyrus/normalize';
 import { lookupCache, writeCache } from '@/lib/cyrus/cache';
 import { formatClassificationsToMarkdown } from '@/lib/cyrus/format-output';
 import { loadMasterTaxonomy, isValidPath } from '@/lib/cyrus/taxonomy';
-import { retrieveCandidates, buildSearchIndex } from '@/lib/cyrus/retrieve';
+import { retrieveCandidates, ensureSearchIndex, retrieveCandidatesHybrid } from '@/lib/cyrus/retrieve';
 import { routeLabels, getSectorsForLabel } from '@/lib/cyrus/router';
 import { classifyInSector } from '@/lib/cyrus/expert';
 import { validateDecisions } from '@/lib/cyrus/validator';
@@ -198,10 +198,12 @@ async function classifyBatchV2(
   logger?: CyrusLogger,
 ): Promise<FinalClassification[]> {
   const candidatesMap = new Map<string, CandidateNode[]>();
-  for (const record of records) {
-    const candidates = retrieveCandidates(record.normalizedLabel);
-    candidatesMap.set(record.normalizedLabel, candidates);
-  }
+  await Promise.all(
+    records.map(async (record) => {
+      const candidates = await retrieveCandidatesHybrid(record.normalizedLabel);
+      candidatesMap.set(record.normalizedLabel, candidates);
+    }),
+  );
 
   const labels = records.map((r) => r.normalizedLabel);
   const routingDecisions = await routeLabels(labels, candidatesMap);
@@ -375,10 +377,9 @@ export async function runCyrusPipeline(
 
       try {
         metrics.startStep('retrieval');
-        buildSearchIndex();
+        ensureSearchIndex();
         metrics.endStep('retrieval');
 
-        metrics.startStep('routing');
         metrics.startStep('expert');
 
         newClassifications = await processBatches(
@@ -389,12 +390,10 @@ export async function runCyrusPipeline(
         );
 
         metrics.endStep('expert');
-        metrics.endStep('routing');
 
         logger.info('pipeline', `V2 classified ${newClassifications.length} labels`);
       } catch (error) {
         metrics.endStep('expert');
-        metrics.endStep('routing');
         logger.error(
           'pipeline',
           'V2 pipeline failed, falling back to legacy',
@@ -425,6 +424,7 @@ export async function runCyrusPipeline(
       }
 
       for (const cls of newClassifications) {
+        if (cls.sectorCode === '') continue;
         const key = cls.normalizedLabel.replace(/\s+/g, '_').toLowerCase();
         allClassifications.set(key, cls);
       }

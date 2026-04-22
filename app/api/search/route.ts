@@ -41,6 +41,7 @@ import { geolocation } from '@vercel/functions';
 import { createStreamResponse } from '@/lib/streaming-heartbeat';
 import { runCyrusPipeline } from '@/lib/cyrus/run-cyrus-pipeline';
 import { SMALL_INPUT_THRESHOLD, CYRUS_V2_ENABLED } from '@/lib/cyrus/constants';
+import { getRAGContextForMessage } from '@/lib/hierarchy-lookup';
 
 
 import { GroqProviderOptions } from '@ai-sdk/groq';
@@ -267,16 +268,27 @@ export async function POST(req: Request) {
 
             const processingTime = (Date.now() - requestStartTime) / 1000;
 
-            (dataStream as any).write({ type: 'text-start' });
-            (dataStream as any).write({
-              type: 'text-delta',
-              text: pipelineResult.markdown,
+            const partId = uuidv7();
+            dataStream.write({
+              type: 'start',
+              messageMetadata: {
+                model: resolvedModel as string,
+                completionTime: processingTime,
+                createdAt: new Date().toISOString(),
+                totalTokens: 0,
+                inputTokens: 0,
+                outputTokens: 0,
+              },
             });
-            (dataStream as any).write({ type: 'text-finish' });
-            (dataStream as any).write({
-              type: 'finish-message',
-              finishReason: 'stop',
-              usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+            dataStream.write({ type: 'text-start', id: partId });
+            dataStream.write({
+              type: 'text-delta',
+              id: partId,
+              delta: pipelineResult.markdown,
+            });
+            dataStream.write({ type: 'text-end', id: partId });
+            dataStream.write({
+              type: 'finish',
               messageMetadata: {
                 model: resolvedModel as string,
                 completionTime: processingTime,
@@ -287,6 +299,15 @@ export async function POST(req: Request) {
               },
             });
 
+            if (user?.id && !shouldBypassRateLimits(resolvedModel, user)) {
+              after(async () => {
+                try {
+                  await incrementMessageUsage({ userId: user.id });
+                } catch (error) {
+                }
+              });
+            }
+
             return;
           } catch (pipelineError) {
             console.error('[Cyrus V2] Pipeline failed, falling back to legacy:', pipelineError);
@@ -296,6 +317,15 @@ export async function POST(req: Request) {
       // --- FIN CYRUS V2 ---
 
       const streamStartTime = Date.now();
+
+      let ragContext = '';
+      if (group === 'cyrus') {
+        const lastMsg = messages[messages.length - 1];
+        const msgText = typeof lastMsg.content === 'string'
+          ? lastMsg.content
+          : lastMsg.parts?.filter((p: any) => p.type === 'text').map((p: any) => p.text).join('\n') || '';
+        ragContext = await getRAGContextForMessage(msgText);
+      }
 
       const result = streamText({
         model: hyper.languageModel(resolvedModel),
@@ -309,6 +339,7 @@ export async function POST(req: Request) {
         experimental_transform: markdownJoinerTransform(),
         system:
           instructions +
+          (group === 'cyrus' && ragContext ? ragContext : '') +
           (customInstructions && (isCustomInstructionsEnabled ?? true)
             ? `\n\nThe user's custom instructions are as follows and YOU MUST FOLLOW THEM AT ALL COSTS: ${customInstructions?.content}`
             : '\n') +
